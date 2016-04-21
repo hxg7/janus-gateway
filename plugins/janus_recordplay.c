@@ -360,6 +360,7 @@ typedef struct janus_recordplay_recording {
 	guint64 id;			/* Recording unique ID */
 	char *name;			/* Name of the recording */
 	char *date;			/* Time of the recording */
+	char *rc_dir;		/* Directory of audio and video files */
 	char *arc_file;		/* Audio file name */
 	char *vrc_file;		/* Video file name */
 	GList *viewers;		/* List of users watching this recording */
@@ -497,6 +498,33 @@ void *janus_recordplay_watchdog(void *data) {
 	return NULL;
 }
 
+janus_recordplay_recording *janus_recordplay_create_rec(const char *rc_dir_text,
+														const char *arc_file_text,
+														const char *vrc_file_text);
+janus_recordplay_recording *janus_recordplay_create_rec(const char *rc_dir_text,
+														const char *arc_file_text,
+														const char *vrc_file_text) {
+	JANUS_LOG(LOG_INFO, "Create a new recording");
+
+	janus_recordplay_recording *rec = (janus_recordplay_recording *) g_malloc0(sizeof(janus_recordplay_recording));
+	rec->id = 0;
+	rec->name = g_strdup("Default recording");
+	rec->viewers = NULL;
+	rec->destroyed = 0;
+	janus_mutex_init(&rec->mutex);
+
+	/* Create a date string */
+	time_t t = time(NULL);
+	struct tm *tmv = localtime(&t);
+	char outstr[200];
+	strftime(outstr, sizeof(outstr), "%Y-%m-%d %H:%M:%S", tmv);
+	rec->date = g_strdup(outstr);
+	rec->rc_dir = g_strdup(rc_dir_text);
+	rec->arc_file = g_strdup(arc_file_text);
+	rec->vrc_file = g_strdup(vrc_file_text);
+
+	return rec;
+}
 
 /* Plugin implementation */
 int janus_recordplay_init(janus_callbacks *callback, const char *config_path) {
@@ -1186,6 +1214,7 @@ static void *janus_recordplay_handler(void *data) {
 			char outstr[200];
 			strftime(outstr, sizeof(outstr), "%Y-%m-%d %H:%M:%S", tmv);
 			rec->date = g_strdup(outstr);
+			rec->rc_dir = g_strdup(recordings_path);
 			if(strstr(msg->sdp, "m=audio")) {
 				char filename[256];
 				if(filename_text != NULL) {
@@ -1194,7 +1223,7 @@ static void *janus_recordplay_handler(void *data) {
 					g_snprintf(filename, 256, "rec-%"SCNu64"-audio", id);
 				}
 				rec->arc_file = g_strdup(filename);
-				session->arc = janus_recorder_create(recordings_path, 0, rec->arc_file);
+				session->arc = janus_recorder_create(rec->rc_dir, 0, rec->arc_file);
 			}
 			if(strstr(msg->sdp, "m=video")) {
 				char filename[256];
@@ -1204,7 +1233,7 @@ static void *janus_recordplay_handler(void *data) {
 					g_snprintf(filename, 256, "rec-%"SCNu64"-video", id);
 				}
 				rec->vrc_file = g_strdup(filename);
-				session->vrc = janus_recorder_create(recordings_path, 1, rec->vrc_file);
+				session->vrc = janus_recorder_create(rec->rc_dir, 1, rec->vrc_file);
 			}
 			session->recorder = TRUE;
 			session->recording = rec;
@@ -1259,32 +1288,111 @@ static void *janus_recordplay_handler(void *data) {
 			}
 			JANUS_LOG(LOG_VERB, "Replaying a recording\n");
 			json_t *id = json_object_get(root, "id");
-			if(!id) {
+			/* make id optional */
+			/*if(!id) {
 				JANUS_LOG(LOG_ERR, "Missing element (id)\n");
 				error_code = JANUS_RECORDPLAY_ERROR_MISSING_ELEMENT;
 				g_snprintf(error_cause, 512, "Missing element (id)");
 				goto error;
+			}*/
+			guint64 id_value = -1;
+			janus_recordplay_recording *rec = NULL;
+			if (id) {
+				if(!json_is_integer(id) || json_integer_value(id) < 0) {
+					JANUS_LOG(LOG_ERR, "Invalid element (id should be a positive integer)\n");
+					error_code = JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT;
+					g_snprintf(error_cause, 512, "Invalid element (id should be a positive integer)");
+					goto error;
+				}
+				id_value = json_integer_value(id);
+				/* Look for this recording */
+				janus_mutex_lock(&recordings_mutex);
+				rec = g_hash_table_lookup(recordings, GINT_TO_POINTER(id_value));
+				janus_mutex_unlock(&recordings_mutex);
+				if (rec == NULL) {
+					janus_recordplay_update_recordings_list();
+					rec = g_hash_table_lookup(recordings, GINT_TO_POINTER(id_value));
+				}
+				if(rec == NULL || rec->destroyed) {
+					JANUS_LOG(LOG_ERR, "No such recording\n");
+					error_code = JANUS_RECORDPLAY_ERROR_NOT_FOUND;
+					g_snprintf(error_cause, 512, "No such recording");
+					goto error;
+				}
 			}
-			if(!json_is_integer(id) || json_integer_value(id) < 0) {
-				JANUS_LOG(LOG_ERR, "Invalid element (id should be a positive integer)\n");
-				error_code = JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT;
-				g_snprintf(error_cause, 512, "Invalid element (id should be a positive integer)");
-				goto error;
+
+			/* Parse rc_dir */
+			json_t *rc_dir = json_object_get(root, "rc_dir");
+			const char *rc_dir_text = NULL;
+			if (rc_dir) {
+				JANUS_LOG(LOG_INFO, "Parsing rc_dir\n");
+				if (!json_is_string(rc_dir)) {
+					JANUS_LOG(LOG_ERR, "Invalid element (rc_dir should be a string)\n");
+					error_code = JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT;
+					g_snprintf(error_cause, 512, "Invalid element (rc_dir should be a string)");
+					goto error;
+				}
+				rc_dir_text = json_string_value(rc_dir);
+				if (strlen(rc_dir_text) == 0) {
+					JANUS_LOG(LOG_ERR, "Invalid element (rc_dir is an empty string)\n");
+					error_code = JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT;
+					g_snprintf(error_cause, 512, "Invalid element (rc_dir is an empty string)");
+					goto error;
+				}
 			}
-			guint64 id_value = json_integer_value(id);
-			/* Look for this recording */
-			janus_mutex_lock(&recordings_mutex);
-			janus_recordplay_recording *rec = g_hash_table_lookup(recordings, GINT_TO_POINTER(id_value));
-			janus_mutex_unlock(&recordings_mutex);
-			if(rec == NULL || rec->destroyed) {
-				JANUS_LOG(LOG_ERR, "No such recording\n");
-				error_code = JANUS_RECORDPLAY_ERROR_NOT_FOUND;
-				g_snprintf(error_cause, 512, "No such recording");
-				goto error;
+			JANUS_LOG(LOG_INFO, "Received rc_dir: %s\n", rc_dir_text);
+
+
+			/* Parse arc_file */
+			json_t *arc_file = json_object_get(root, "arc_file");
+			const char *arc_file_text = NULL;
+			if (arc_file) {
+				JANUS_LOG(LOG_INFO, "Parsing arc_file\n");
+				if (!json_is_string(arc_file)) {
+					JANUS_LOG(LOG_ERR, "Invalid element (arc_file should be a string)\n");
+					error_code = JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT;
+					g_snprintf(error_cause, 512, "Invalid element (arc_file should be a string)");
+					goto error;
+				}
+				arc_file_text = json_string_value(arc_file);
+				if (strlen(arc_file_text) == 0) {
+					JANUS_LOG(LOG_ERR, "Invalid element (arc_file is an empty string)\n");
+					error_code = JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT;
+					g_snprintf(error_cause, 512, "Invalid element (arc_file is an empty string)");
+					goto error;
+				}
 			}
+			JANUS_LOG(LOG_INFO, "Received arc_file: %s\n", arc_file_text);
+
+			/* Parse vrc_file */
+			json_t *vrc_file = json_object_get(root, "vrc_file");
+			const char *vrc_file_text = NULL;
+			if (vrc_file) {
+				if (!json_is_string(vrc_file)) {
+					JANUS_LOG(LOG_ERR, "Invalid element (vrc_file should be a string)\n");
+					error_code = JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT;
+					g_snprintf(error_cause, 512, "Invalid element (vrc_file should be a string)");
+					goto error;
+				}
+				vrc_file_text = json_string_value(vrc_file);
+				if (strlen(vrc_file_text) == 0) {
+					JANUS_LOG(LOG_ERR, "Invalid element (vrc_file is an empty string)\n");
+					error_code = JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT;
+					g_snprintf(error_cause, 512, "Invalid element (vrc_file is an empty string)");
+					goto error;
+				}
+			}
+			JANUS_LOG(LOG_INFO, "Received vrc_file: %s\n", vrc_file_text);
+
+			/* Create a rec */
+			if (!rec) {
+				id_value = 0;
+				rec = janus_recordplay_create_rec(rc_dir_text, arc_file_text, vrc_file_text);
+			}
+
 			/* Access the frames */
 			if(rec->arc_file) {
-				session->aframes = janus_recordplay_get_frames(recordings_path, rec->arc_file);
+				session->aframes = janus_recordplay_get_frames(rec->rc_dir, rec->arc_file);
 				if(session->aframes == NULL) {
 					JANUS_LOG(LOG_ERR, "Error opening audio recording\n");
 					error_code = JANUS_RECORDPLAY_ERROR_INVALID_RECORDING;
@@ -1292,8 +1400,9 @@ static void *janus_recordplay_handler(void *data) {
 					goto error;
 				}
 			}
+
 			if(rec->vrc_file) {
-				session->vframes = janus_recordplay_get_frames(recordings_path, rec->vrc_file);
+				session->vframes = janus_recordplay_get_frames(rec->rc_dir, rec->vrc_file);
 				if(session->vframes == NULL) {
 					JANUS_LOG(LOG_ERR, "Error opening video recording\n");
 					error_code = JANUS_RECORDPLAY_ERROR_INVALID_RECORDING;
@@ -1301,6 +1410,7 @@ static void *janus_recordplay_handler(void *data) {
 					goto error;
 				}
 			}
+
 			session->recording = rec;
 			session->recorder = FALSE;
 			rec->viewers = g_list_append(rec->viewers, session);
@@ -1332,6 +1442,7 @@ static void *janus_recordplay_handler(void *data) {
 				session->recording->name,		/* Playout session */
 				audio_mline,					/* Audio m-line, if any */
 				video_mline);					/* Video m-line, if any */
+
 			sdp = g_strdup(sdptemp);
 			JANUS_LOG(LOG_VERB, "Going to offer this SDP:\n%s\n", sdp);
 			/* Done! */
@@ -1618,6 +1729,7 @@ janus_recordplay_frame_packet *janus_recordplay_get_frames(const char *dir, cons
 		g_snprintf(source, 1024, "%s/%s", dir, filename);
 	else
 		g_snprintf(source, 1024, "%s/%s.mjr", dir, filename);
+
 	FILE *file = fopen(source, "rb");
 	if(file == NULL) {
 		JANUS_LOG(LOG_ERR, "Could not open file %s\n", source);
@@ -1941,9 +2053,9 @@ static void *janus_recordplay_playout_thread(void *data) {
 	if(session->aframes) {
 		char source[1024];
 		if(strstr(session->recording->arc_file, ".mjr"))
-			g_snprintf(source, 1024, "%s/%s", recordings_path, session->recording->arc_file);
+			g_snprintf(source, 1024, "%s/%s", session->recording->rc_dir, session->recording->arc_file);
 		else
-			g_snprintf(source, 1024, "%s/%s.mjr", recordings_path, session->recording->arc_file);
+			g_snprintf(source, 1024, "%s/%s.mjr", session->recording->rc_dir, session->recording->arc_file);
 		afile = fopen(source, "rb");
 		if(afile == NULL) {
 			JANUS_LOG(LOG_ERR, "Could not open audio file %s, can't start playout thread...\n", source);
@@ -1954,9 +2066,9 @@ static void *janus_recordplay_playout_thread(void *data) {
 	if(session->vframes) {
 		char source[1024];
 		if(strstr(session->recording->vrc_file, ".mjr"))
-			g_snprintf(source, 1024, "%s/%s", recordings_path, session->recording->vrc_file);
+			g_snprintf(source, 1024, "%s/%s", session->recording->rc_dir, session->recording->vrc_file);
 		else
-			g_snprintf(source, 1024, "%s/%s.mjr", recordings_path, session->recording->vrc_file);
+			g_snprintf(source, 1024, "%s/%s.mjr", session->recording->rc_dir, session->recording->vrc_file);
 		vfile = fopen(source, "rb");
 		if(vfile == NULL) {
 			JANUS_LOG(LOG_ERR, "Could not open video file %s, can't start playout thread...\n", source);

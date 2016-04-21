@@ -496,6 +496,58 @@ typedef struct janus_videoroom_rtp_relay_packet {
 #define JANUS_VIDEOROOM_ERROR_ID_EXISTS			436
 #define JANUS_VIDEOROOM_ERROR_INVALID_SDP		437
 
+static void janus_create_nfo_file(janus_videoroom_participant *participant, gint64 now) {
+	/* Create a date string */
+	time_t t = time(NULL);
+	struct tm *tmv = localtime(&t);
+	char outstr[200];
+	strftime(outstr, sizeof(outstr), "%Y-%m-%d %H:%M:%S", tmv);
+	char* nfo_date = g_strdup(outstr);
+
+	/* Create a .nfo file for this recording */
+	char nfofile[1024], nfo[1024];
+	g_snprintf(nfofile, 1024,
+		"%s/videoroom-%"SCNu64"-user-%"SCNu64"-%"SCNu64".nfo",
+		participant->room->rec_dir,
+		participant->room->room_id,
+		participant->user_id,
+		now);
+	JANUS_LOG(LOG_INFO, "Creating nfo file %s...\n", nfofile);
+	FILE *file = fopen(nfofile, "wt");
+	if (file == NULL) {
+		JANUS_LOG(LOG_ERR, "Error creating file %s...\n", nfofile);
+	} else {
+		if (participant->vrc && participant->arc) {
+		g_snprintf(nfo, 1024,
+				"[%"SCNu64"]\r\n"
+				"name = %s\r\n"
+				"date = %s\r\n"
+				"audio = %s\r\n"
+				"video = %s\r\n",
+				participant->user_id, participant->display, nfo_date,
+				participant->arc->filename, participant->vrc->filename);
+		} else if (participant->arc) {
+			g_snprintf(nfo, 1024,
+				"[%"SCNu64"]\r\n"
+				"name = %s\r\n"
+				"date = %s\r\n"
+				"audio = %s\r\n",
+				participant->user_id, participant->display, nfo_date,
+				participant->arc->filename);
+		} else if (participant->vrc) {
+			g_snprintf(nfo, 1024,
+				"[%"SCNu64"]\r\n"
+				"name = %s\r\n"
+				"date = %s\r\n"
+				"video = %s\r\n",
+				participant->user_id, participant->display, nfo_date,
+				participant->vrc->filename);
+		}
+		/* Write to the file now */
+		fwrite(nfo, strlen(nfo), sizeof(char), file);
+		fclose(file);
+	}
+}
 
 /* Multiplexing helpers */
 int janus_videoroom_muxed_subscribe(janus_videoroom_listener_muxed *muxed_listener, GList *feeds, char *transaction);
@@ -3069,6 +3121,7 @@ static void *janus_videoroom_handler(void *data) {
 								participant->user_id, participant->display ? participant->display : "??");
 							gateway->relay_rtcp(participant->session->handle, 1, buf, 12);
 						}
+						janus_create_nfo_file(participant, now);
 					}
 				}
 				/* Done */
@@ -3866,6 +3919,7 @@ static void *janus_videoroom_handler(void *data) {
 							}
 						}
 					}
+					janus_create_nfo_file(participant, now);
 				}
 
 				JANUS_LOG(LOG_VERB, "Handling publisher: turned this into an '%s':\n%s\n", type, newsdp);
