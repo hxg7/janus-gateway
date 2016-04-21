@@ -2331,6 +2331,16 @@ void janus_videoroom_hangup_media(janus_plugin_session *handle) {
 		participant->remb_latest = 0;
 		participant->fir_latest = 0;
 		participant->fir_seq = 0;
+
+		/*
+		 * janus_recorder_create() assumed that the full path of the file was less than 1024 char.
+		 * save path before free recorders.
+		 */
+		char arc_file_text[1024];
+		char vrc_file_text[1024];
+		g_snprintf(arc_file_text, 1024, "%s/%s", participant->arc->dir, participant->arc->filename);
+		g_snprintf(vrc_file_text, 1024, "%s/%s", participant->vrc->dir, participant->vrc->filename);
+
 		/* Get rid of the recorders, if available */
 		if(participant->arc) {
 			janus_recorder_close(participant->arc);
@@ -2357,6 +2367,9 @@ void janus_videoroom_hangup_media(janus_plugin_session *handle) {
 		json_object_set_new(event, "videoroom", json_string("event"));
 		json_object_set_new(event, "room", json_integer(participant->room->room_id));
 		json_object_set_new(event, "unpublished", json_integer(participant->user_id));
+		json_object_set_new(event, "arc_file", json_string(arc_file_text));
+		json_object_set_new(event, "vrc_file", json_string(vrc_file_text));
+
 		char *unpub_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
 		json_decref(event);
 		GHashTableIter iter;
@@ -4089,11 +4102,21 @@ static void *janus_videoroom_handler(void *data) {
 					json_object_set_new(pl, "id", json_integer(participant->user_id));
 					if(participant->display)
 						json_object_set_new(pl, "display", json_string(participant->display));
+
+					/* janus_recorder_create() assumed that the full path of the file was less than 1024 char */
+					char arc_file_text[1024];
+					char vrc_file_text[1024];
+					g_snprintf(arc_file_text, 1024, "%s/%s", participant->arc->dir, participant->arc->filename);
+					g_snprintf(vrc_file_text, 1024, "%s/%s", participant->vrc->dir, participant->vrc->filename);
+					json_object_set_new(pl, "arc_file", json_string(arc_file_text));
+					json_object_set_new(pl, "vrc_file", json_string(vrc_file_text));
+
 					json_array_append_new(list, pl);
 					json_t *pub = json_object();
 					json_object_set_new(pub, "videoroom", json_string("event"));
 					json_object_set_new(pub, "room", json_integer(participant->room->room_id));
 					json_object_set_new(pub, "publishers", list);
+
 					char *pub_text = json_dumps(pub, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
 					json_decref(pub);
 					GHashTableIter iter;
