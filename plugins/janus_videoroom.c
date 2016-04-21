@@ -2336,19 +2336,19 @@ void janus_videoroom_hangup_media(janus_plugin_session *handle) {
 		 * janus_recorder_create() assumed that the full path of the file was less than 1024 char.
 		 * save path before free recorders.
 		 */
-		char arc_file_text[1024];
-		char vrc_file_text[1024];
-		g_snprintf(arc_file_text, 1024, "%s/%s", participant->arc->dir, participant->arc->filename);
-		g_snprintf(vrc_file_text, 1024, "%s/%s", participant->vrc->dir, participant->vrc->filename);
+		char arc_file_text[1024] = "\0";
+		char vrc_file_text[1024] = "\0";
 
 		/* Get rid of the recorders, if available */
 		if(participant->arc) {
+			g_snprintf(arc_file_text, 1024, "%s", participant->arc->filename);
 			janus_recorder_close(participant->arc);
 			JANUS_LOG(LOG_INFO, "Closed audio recording %s\n", participant->arc->filename ? participant->arc->filename : "??");
 			janus_recorder_free(participant->arc);
 		}
 		participant->arc = NULL;
 		if(participant->vrc) {
+			g_snprintf(vrc_file_text, 1024, "%s", participant->vrc->filename);
 			janus_recorder_close(participant->vrc);
 			JANUS_LOG(LOG_INFO, "Closed video recording %s\n", participant->vrc->filename ? participant->vrc->filename : "??");
 			janus_recorder_free(participant->vrc);
@@ -2367,8 +2367,12 @@ void janus_videoroom_hangup_media(janus_plugin_session *handle) {
 		json_object_set_new(event, "videoroom", json_string("event"));
 		json_object_set_new(event, "room", json_integer(participant->room->room_id));
 		json_object_set_new(event, "unpublished", json_integer(participant->user_id));
-		json_object_set_new(event, "arc_file", json_string(arc_file_text));
-		json_object_set_new(event, "vrc_file", json_string(vrc_file_text));
+		if (strlen(arc_file_text) > 0) {
+			json_object_set_new(event, "arc_file", json_string(arc_file_text));
+		}
+		if (strlen(vrc_file_text) > 0) {
+			json_object_set_new(event, "vrc_file", json_string(vrc_file_text));
+		}
 
 		char *unpub_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
 		json_decref(event);
@@ -4102,14 +4106,8 @@ static void *janus_videoroom_handler(void *data) {
 					json_object_set_new(pl, "id", json_integer(participant->user_id));
 					if(participant->display)
 						json_object_set_new(pl, "display", json_string(participant->display));
-
-					/* janus_recorder_create() assumed that the full path of the file was less than 1024 char */
-					char arc_file_text[1024];
-					char vrc_file_text[1024];
-					g_snprintf(arc_file_text, 1024, "%s/%s", participant->arc->dir, participant->arc->filename);
-					g_snprintf(vrc_file_text, 1024, "%s/%s", participant->vrc->dir, participant->vrc->filename);
-					json_object_set_new(pl, "arc_file", json_string(arc_file_text));
-					json_object_set_new(pl, "vrc_file", json_string(vrc_file_text));
+					json_object_set_new(pl, "arc_file", json_string(participant->arc->filename));
+					json_object_set_new(pl, "vrc_file", json_string(participant->vrc->filename));
 
 					json_array_append_new(list, pl);
 					json_t *pub = json_object();
