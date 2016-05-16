@@ -336,7 +336,10 @@ static struct janus_json_parameter record_parameters[] = {
 	{"filename", JSON_STRING, 0}
 };
 static struct janus_json_parameter play_parameters[] = {
-	{"id", JSON_INTEGER, JANUS_JSON_PARAM_REQUIRED | JANUS_JSON_PARAM_POSITIVE}
+	{"id", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"rc_dir", JSON_STRING, 0},
+	{"arc_file", JSON_STRING, 0},
+	{"vrc_file", JSON_STRING, 0}
 };
 
 /* Useful stuff */
