@@ -41,6 +41,7 @@
 #define JANUS_AUTHOR			"Meetecho s.r.l."
 #define JANUS_VERSION			10
 #define JANUS_VERSION_STRING	"0.1.0"
+#define JANUS_SERVER_NAME		"MyJanusInstance"
 
 #ifdef __MACH__
 #define SHLIB_EXT "0.dylib"
@@ -79,6 +80,22 @@ gchar *janus_get_server_key(void) {
 /* API secrets */
 static char *api_secret = NULL, *admin_api_secret = NULL;
 
+/* JSON parameters */
+static int janus_process_error_string(janus_request *request, uint64_t session_id, const char *transaction, gint error, gchar *error_string);
+
+static struct janus_json_parameter incoming_request_parameters[] = {
+	{"transaction", JSON_STRING, JANUS_JSON_PARAM_REQUIRED},
+	{"janus", JSON_STRING, JANUS_JSON_PARAM_REQUIRED},
+	{"id", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE}
+};
+static struct janus_json_parameter attach_parameters[] = {
+	{"plugin", JSON_STRING, JANUS_JSON_PARAM_REQUIRED}
+};
+static struct janus_json_parameter jsep_parameters[] = {
+	{"type", JSON_STRING, JANUS_JSON_PARAM_REQUIRED},
+	{"trickle", JANUS_JSON_BOOL, 0},
+	{"sdp", JSON_STRING, JANUS_JSON_PARAM_REQUIRED}
+};
 
 /* Admin/Monitor helpers */
 json_t *janus_admin_stream_summary(janus_ice_stream *stream);
@@ -107,6 +124,10 @@ gint janus_is_stopping(void) {
 }
 
 
+/* Public instance name */
+static gchar *server_name = NULL;
+
+
 /* Information */
 json_t *janus_info(const char *transaction);
 json_t *janus_info(const char *transaction) {
@@ -128,6 +149,7 @@ json_t *janus_info(const char *transaction) {
 #else
 	json_object_set_new(info, "data_channels", json_string("false"));
 #endif
+	json_object_set_new(info, "server-name", json_string(server_name ? server_name : JANUS_SERVER_NAME));
 	json_object_set_new(info, "local-ip", json_string(local_ip));
 	if(public_ip != NULL)
 		json_object_set_new(info, "public-ip", json_string(public_ip));
@@ -219,6 +241,8 @@ static void janus_handle_signal(int signum) {
 
 /*! \brief Termination handler (atexit) */
 static void janus_termination_handler(void) {
+	/* Free the instance name, if provided */
+	g_free(server_name);
 	/* Remove the PID file if we created it */
 	janus_pidfile_remove();
 	/* Close the logger */
@@ -501,6 +525,8 @@ int janus_process_incoming_request(janus_request *request) {
 		JANUS_LOG(LOG_ERR, "Missing request or payload to process, giving up...\n");
 		return ret;
 	}
+	int error_code = 0;
+	char error_cause[100];
 	json_t *root = request->message;
 	/* Ok, let's start with the ids */
 	guint64 session_id = 0, handle_id = 0;
@@ -512,25 +538,16 @@ int janus_process_incoming_request(janus_request *request) {
 		handle_id = json_integer_value(h);
 
 	/* Get transaction and message request */
+	JANUS_VALIDATE_JSON_OBJECT(root, incoming_request_parameters,
+		error_code, error_cause, FALSE,
+		JANUS_ERROR_MISSING_MANDATORY_ELEMENT, JANUS_ERROR_INVALID_ELEMENT_TYPE);
+	if(error_code != 0) {
+		ret = janus_process_error_string(request, session_id, NULL, error_code, error_cause);
+		goto jsondone;
+	}
 	json_t *transaction = json_object_get(root, "transaction");
-	if(!transaction) {
-		ret = janus_process_error(request, session_id, NULL, JANUS_ERROR_MISSING_MANDATORY_ELEMENT, "Missing mandatory element (transaction)");
-		goto jsondone;
-	}
-	if(!json_is_string(transaction)) {
-		ret = janus_process_error(request, session_id, NULL, JANUS_ERROR_INVALID_ELEMENT_TYPE, "Invalid element type (transaction should be a string)");
-		goto jsondone;
-	}
 	const gchar *transaction_text = json_string_value(transaction);
 	json_t *message = json_object_get(root, "janus");
-	if(!message) {
-		ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_MISSING_MANDATORY_ELEMENT, "Missing mandatory element (janus)");
-		goto jsondone;
-	}
-	if(!json_is_string(message)) {
-		ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_INVALID_ELEMENT_TYPE, "Invalid element type (janus should be a string)");
-		goto jsondone;
-	}
 	const gchar *message_text = json_string_value(message);
 	
 	if(session_id == 0 && handle_id == 0) {
@@ -582,10 +599,6 @@ int janus_process_incoming_request(janus_request *request) {
 		json_t *id = json_object_get(root, "id");
 		if(id != NULL) {
 			/* The application provided the session ID to use */
-			if(!json_is_integer(id) || json_integer_value(id) < 0) {
-				ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_INVALID_ELEMENT_TYPE, "Invalid element type (id should be a positive integer)");
-				goto jsondone;
-			}
 			session_id = json_integer_value(id);
 			if(session_id > 0 && janus_session_find(session_id) != NULL) {
 				/* Session ID already taken */
@@ -689,15 +702,14 @@ int janus_process_incoming_request(janus_request *request) {
 			ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_INVALID_REQUEST_PATH, "Unhandled request '%s' at this path", message_text);
 			goto jsondone;
 		}
+		JANUS_VALIDATE_JSON_OBJECT(root, attach_parameters,
+			error_code, error_cause, FALSE,
+			JANUS_ERROR_MISSING_MANDATORY_ELEMENT, JANUS_ERROR_INVALID_ELEMENT_TYPE);
+		if(error_code != 0) {
+			ret = janus_process_error_string(request, session_id, NULL, error_code, error_cause);
+			goto jsondone;
+		}
 		json_t *plugin = json_object_get(root, "plugin");
-		if(!plugin) {
-			ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_MISSING_MANDATORY_ELEMENT, "Missing mandatory element (plugin)");
-			goto jsondone;
-		}
-		if(!json_is_string(plugin)) {
-			ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_INVALID_ELEMENT_TYPE, "Invalid element type (plugin should be a string)");
-			goto jsondone;
-		}
 		const gchar *plugin_text = json_string_value(plugin);
 		janus_plugin *plugin_t = janus_plugin_find(plugin_text);
 		if(plugin_t == NULL) {
@@ -848,23 +860,19 @@ int janus_process_incoming_request(janus_request *request) {
 				ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_INVALID_JSON_OBJECT, "Invalid jsep object");
 				goto jsondone;
 			}
+			JANUS_VALIDATE_JSON_OBJECT_FORMAT("JSEP error: missing mandatory element (%s)",
+				"JSEP error: invalid element type (%s should be %s)",
+				jsep, jsep_parameters, error_code, error_cause, FALSE,
+				JANUS_ERROR_MISSING_MANDATORY_ELEMENT, JANUS_ERROR_INVALID_ELEMENT_TYPE);
+			if(error_code != 0) {
+				ret = janus_process_error_string(request, session_id, transaction_text, error_code, error_cause);
+				goto jsondone;
+			}
 			json_t *type = json_object_get(jsep, "type");
-			if(!type) {
-				ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_MISSING_MANDATORY_ELEMENT, "JSEP error: missing mandatory element (type)");
-				goto jsondone;
-			}
-			if(!json_is_string(type)) {
-				ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_INVALID_ELEMENT_TYPE, "JSEP error: invalid element type (type should be a string)");
-				goto jsondone;
-			}
 			jsep_type = g_strdup(json_string_value(type));
 			type = NULL;
 			gboolean do_trickle = TRUE;
 			json_t *jsep_trickle = json_object_get(jsep, "trickle");
-			if(jsep_trickle && !json_is_boolean(jsep_trickle)) {
-				ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_INVALID_ELEMENT_TYPE, "JSEP error: invalid element type (trickle should be a boolean)");
-				goto jsondone;
-			}
 			do_trickle = jsep_trickle ? json_is_true(jsep_trickle) : TRUE;
 			/* Are we still cleaning up from a previous media session? */
 			if(janus_flags_is_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_CLEANING)) {
@@ -899,20 +907,6 @@ int janus_process_incoming_request(janus_request *request) {
 				goto jsondone;
 			}
 			json_t *sdp = json_object_get(jsep, "sdp");
-			if(!sdp) {
-				ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_MISSING_MANDATORY_ELEMENT, "JSEP error: missing mandatory element (sdp)");
-				g_free(jsep_type);
-				janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_PROCESSING_OFFER);
-				janus_mutex_unlock(&handle->mutex);
-				goto jsondone;
-			}
-			if(!json_is_string(sdp)) {
-				ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_INVALID_ELEMENT_TYPE, "JSEP error: invalid element type (sdp should be a string)");
-				g_free(jsep_type);
-				janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_PROCESSING_OFFER);
-				janus_mutex_unlock(&handle->mutex);
-				goto jsondone;
-			}
 			jsep_sdp = (char *)json_string_value(sdp);
 			JANUS_LOG(LOG_VERB, "[%"SCNu64"] Remote SDP:\n%s", handle->handle_id, jsep_sdp);
 			/* Is this valid SDP? */
@@ -2166,23 +2160,10 @@ int janus_process_success(janus_request *request, json_t *payload)
 	return request->transport->send_message(request->instance, request->request_id, request->admin, payload);
 }
 
-int janus_process_error(janus_request *request, uint64_t session_id, const char *transaction, gint error, const char *format, ...)
+static int janus_process_error_string(janus_request *request, uint64_t session_id, const char *transaction, gint error, gchar *error_string)
 {
 	if(!request)
 		return -1;
-	gchar *error_string = NULL;
-	gchar error_buf[512];
-	if(format == NULL) {
-		/* No error string provided, use the default one */
-		error_string = (gchar *)janus_get_api_error(error);
-	} else {
-		/* This callback has variable arguments (error string) */
-		va_list ap;
-		va_start(ap, format);
-		g_vsnprintf(error_buf, sizeof(error_buf), format, ap);
-		va_end(ap);
-		error_string = error_buf;
-	}
 	/* Done preparing error */
 	JANUS_LOG(LOG_VERB, "[%s] Returning %s API error %d (%s)\n", transaction, request->admin ? "admin" : "Janus", error, error_string);
 	/* Prepare JSON error */
@@ -2200,6 +2181,25 @@ int janus_process_error(janus_request *request, uint64_t session_id, const char 
 	return request->transport->send_message(request->instance, request->request_id, request->admin, reply);
 }
 
+int janus_process_error(janus_request *request, uint64_t session_id, const char *transaction, gint error, const char *format, ...)
+{
+	if(!request)
+		return -1;
+	gchar *error_string = NULL;
+	gchar error_buf[512];
+	if(format == NULL) {
+		/* No error string provided, use the default one */
+		error_string = (gchar *)janus_get_api_error(error);
+	} else {
+		/* This callback has variable arguments (error string) */
+		va_list ap;
+		va_start(ap, format);
+		g_vsnprintf(error_buf, sizeof(error_buf), format, ap);
+		va_end(ap);
+		error_string = error_buf;
+	}
+	return janus_process_error_string(request, session_id, transaction, error, error_string);
+}
 
 /* Admin/monitor helpers */
 json_t *janus_admin_stream_summary(janus_ice_stream *stream) {
@@ -3170,6 +3170,9 @@ gint main(int argc, char *argv[])
 	if(args_info.disable_colors_given) {
 		janus_config_add_item(config, "general", "debug_colors", "no");
 	}
+	if(args_info.server_name_given) {
+		janus_config_add_item(config, "general", "server_name", args_info.server_name_arg);
+	}
  	if(args_info.interface_given) {
 		janus_config_add_item(config, "general", "interface", args_info.interface_arg);
 	}
@@ -3335,6 +3338,12 @@ gint main(int argc, char *argv[])
 	if (!local_ip_set)
 		janus_detect_local_ip(local_ip, sizeof(local_ip));
 	JANUS_LOG(LOG_INFO, "Using %s as local IP...\n", local_ip);
+
+	/* Was a custom instance name provided? */
+	item = janus_config_get_item_drilldown(config, "general", "server_name");
+	if(item && item->value) {
+		server_name = g_strdup(item->value);
+	}
 
 	/* Is there any API secret to consider? */
 	api_secret = NULL;
