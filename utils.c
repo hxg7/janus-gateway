@@ -18,6 +18,9 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <openssl/evp.h>
+#include <openssl/conf.h>
+#include <openssl/err.h>
 
 #include "utils.h"
 #include "debug.h"
@@ -628,4 +631,121 @@ gboolean janus_json_is_valid(json_t *val, json_type jtype, unsigned int flags) {
 		}
 	}
 	return is_valid;
+}
+
+void janus_digest_message(const char *message, size_t message_len, char **digest, unsigned int *digest_len)
+{
+	EVP_MD_CTX *mdctx;
+
+	if((mdctx = EVP_MD_CTX_create()) == NULL)
+		JANUS_LOG(LOG_ERR, "Failed to create the message digest context\n");
+
+	if(1 != EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL))
+		JANUS_LOG(LOG_ERR, "Failed to initialize the message digest context\n");
+
+	if(1 != EVP_DigestUpdate(mdctx, message, message_len))
+		JANUS_LOG(LOG_ERR, "Failed to update the digest\n");
+
+	if((*digest = (unsigned char *)OPENSSL_malloc(EVP_MD_size(EVP_sha256()))) == NULL)
+		JANUS_LOG(LOG_ERR, "Failed to allocate memory for the digest\n");
+
+	if(1 != EVP_DigestFinal_ex(mdctx, *digest, digest_len))
+		JANUS_LOG(LOG_ERR, "Failed to write the digest\n");
+
+	EVP_MD_CTX_destroy(mdctx);
+}
+
+int janus_encrypt(unsigned char *plaintext, int plaintext_len, unsigned char *key,
+  unsigned char *iv, unsigned char *ciphertext)
+{
+	EVP_CIPHER_CTX *ctx;
+
+	int len;
+
+	int ciphertext_len;
+
+	/* Create and initialise the context */
+	if(!(ctx = EVP_CIPHER_CTX_new()))
+		JANUS_LOG(LOG_ERR, "Error creating cipher context.\n");
+
+	/* Initialise the encryption operation. IMPORTANT - ensure you use a key
+	 * and IV size appropriate for your cipher
+	 * In this example we are using 128 bit AES (i.e. a 128 bit key). The
+	 * IV size for *most* modes is the same as the block size. For AES this
+	 * is 128 bits */
+	if(1 != EVP_EncryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, key, iv))
+		JANUS_LOG(LOG_ERR, "Error initializing the encryption operation.\n");
+
+	/* Provide the message to be encrypted, and obtain the encrypted output.
+	 * EVP_EncryptUpdate can be called multiple times if necessary
+	 */
+	if(1 != EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, plaintext_len))
+		JANUS_LOG(LOG_ERR, "Error encrypting.\n");
+	ciphertext_len = len;
+	
+	/* Finalise the encryption. Further ciphertext bytes may be written at
+	 * this stage.
+	 */
+	if(1 != EVP_EncryptFinal_ex(ctx, ciphertext + len, &len))
+		JANUS_LOG(LOG_ERR, "Error finalizing.\n");
+	ciphertext_len += len;
+	
+	/* Clean up */
+	EVP_CIPHER_CTX_free(ctx);
+	
+	return ciphertext_len;
+}
+
+int janus_decrypt(unsigned char *ciphertext, int ciphertext_len, unsigned char *key,
+  unsigned char *iv, unsigned char *plaintext)
+{
+	EVP_CIPHER_CTX *ctx;
+	int len;
+	int plaintext_len;
+	
+	/* Create and initialise the context */
+	if(!(ctx = EVP_CIPHER_CTX_new())) {
+		JANUS_LOG(LOG_ERR, "Error creating cipher context.\n");
+		return -1;
+	}
+	
+	/* Initialise the decryption operation. IMPORTANT - ensure you use a key
+	 * and IV size appropriate for your cipher
+	 * In this example we are using 128 bit AES (i.e. a 128 bit key). The
+	 * IV size for *most* modes is the same as the block size. For AES this
+	 * is 128 bits */
+	if(1 != EVP_DecryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, key, iv)) {
+		JANUS_LOG(LOG_ERR, "Error initializing the decryption operation.\n");
+
+		EVP_CIPHER_CTX_free(ctx);
+		return -1;
+	}
+
+	EVP_CIPHER_CTX_set_padding(ctx, 0);
+	
+	/* Provide the message to be decrypted, and obtain the plaintext output.
+	 * EVP_DecryptUpdate can be called multiple times if necessary
+	 */
+	if(1 != EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, ciphertext_len)) {
+		JANUS_LOG(LOG_ERR, "Error decrypting.\n");
+
+		EVP_CIPHER_CTX_free(ctx);
+		return -1;
+	}
+	plaintext_len = len;
+	
+	/* Finalise the decryption. Further plaintext bytes may be written at
+	 * this stage.
+	 */
+	if(1 != EVP_DecryptFinal_ex(ctx, plaintext + len, &len)) {
+		JANUS_LOG(LOG_ERR, "Error finalizing.\n");
+
+		EVP_CIPHER_CTX_free(ctx);
+		return -1;
+	}
+	plaintext_len += len;
+
+	/* Clean up */
+	EVP_CIPHER_CTX_free(ctx);
+	return plaintext_len;
 }

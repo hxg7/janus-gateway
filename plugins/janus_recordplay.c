@@ -250,6 +250,10 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <jansson.h>
+#include <openssl/evp.h>
+#include <openssl/conf.h>
+#include <openssl/err.h>
+
 
 #include "../debug.h"
 #include "../apierror.h"
@@ -336,6 +340,7 @@ static struct janus_json_parameter record_parameters[] = {
 	{"filename", JSON_STRING, 0}
 };
 static struct janus_json_parameter play_parameters[] = {
+	{"stoken", JSON_STRING, JANUS_JSON_PARAM_REQUIRED | JANUS_JSON_PARAM_NONEMPTY},
 	{"id", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"rc_dir", JSON_STRING, 0},
 	{"arc_file", JSON_STRING, 0},
@@ -1095,6 +1100,71 @@ void janus_recordplay_hangup_media(janus_plugin_session *handle) {
 	g_async_queue_push(messages, msg);
 }
 
+/*
+ * Process the token and validate
+ *
+ * token = base64(aes256(userid, timestamp))
+ * checksum = sha256(token, rc_dir, arc_file, vrc_file)
+ */
+gboolean validate_token(const char *token_text, int len) {
+	JANUS_LOG(LOG_VERB, "Validating token of length %d: %s\n", len, token_text);
+
+	unsigned char *key = (unsigned char *)"sEcret_kj5pA1jiF";
+	unsigned char *iv  = (unsigned char *)"y09uadfjaJjgfu-Q";
+	unsigned char decryptedtext[512];
+	unsigned char uuid[37];
+	unsigned char timestamp[24];
+	int decryptedtext_len;
+
+	/* Base64 decode the token string. token_text need to be zero-terminated string. */
+	gsize ciphertext_len = 0;
+	guchar *ciphertext = g_base64_decode(token_text, &ciphertext_len);
+	JANUS_LOG(LOG_VERB, "Base64 decoded token of length %ld: %s\n",
+			  (long) ciphertext_len, ciphertext);
+
+
+	/* Initialise the library */
+	ERR_load_crypto_strings();
+	OpenSSL_add_all_algorithms();
+	OPENSSL_config(NULL);
+  
+	/* Do something useful with the ciphertext here */
+	JANUS_LOG(LOG_VERB, "Ciphertext is:\n");
+	BIO_dump_fp(stdout, (const char *)ciphertext, ciphertext_len);
+
+	/* Decrypt the ciphertext */
+	decryptedtext_len = janus_decrypt(ciphertext, ciphertext_len, key, iv, decryptedtext);
+	if (decryptedtext_len == -1) {
+		EVP_cleanup();
+		ERR_free_strings();
+		g_free(ciphertext);
+		return FALSE;
+	}
+
+	/* Add a NULL terminator. We are expecting printable text */
+	decryptedtext[decryptedtext_len] = '\0';
+
+	/* Show the decrypted text */
+	JANUS_LOG(LOG_VERB, "Decrypted text of length %d:\n%s\n", decryptedtext_len, decryptedtext);
+	memcpy(uuid, decryptedtext, 36);
+	uuid[36] = '\0';
+	JANUS_LOG(LOG_VERB, "Decrypted uuid is:\n%s\n", uuid);
+	memcpy(timestamp, decryptedtext+36, 23);
+	timestamp[23] = '\0';
+	JANUS_LOG(LOG_VERB, "Decrypted timestamp is:\n%s\n", timestamp);
+
+	/* Clean up */
+	EVP_cleanup();
+	ERR_free_strings();
+	g_free(ciphertext);
+
+//	unsigned int digest_len = 256;
+//    char *digest = g_malloc0(digest_len);
+//	janus_digest_message("abcd", 4, &digest, &digest_len);
+//	JANUS_LOG(LOG_INFO, "digest: %s\n", digest);
+	return TRUE;
+}
+
 /* Thread to handle incoming messages */
 static void *janus_recordplay_handler(void *data) {
 	JANUS_LOG(LOG_VERB, "Joining Record&Play handler thread\n");
@@ -1266,14 +1336,33 @@ static void *janus_recordplay_handler(void *data) {
 				JANUS_RECORDPLAY_ERROR_MISSING_ELEMENT, JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT);
 			if(error_code != 0)
 				goto error;
+
+			/* Parse the token first. Refuse service if the token is invalid */
+			json_t *token = json_object_get(root, "stoken");
+			const char *token_text = NULL;
+			token_text = json_string_value(token);
+			JANUS_LOG(LOG_VERB, "Received token: %s\n", token_text);
+			if (!validate_token(token_text, strlen(token_text))) {
+				JANUS_LOG(LOG_ERR, "Token is invalid\n");
+				error_code = JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT;
+				g_snprintf(error_cause, 512, "Token is invalid");
+				goto error;
+			}
+
 			json_t *id = json_object_get(root, "id");
+			janus_recordplay_recording *rec = NULL;
+			guint64 id_value = -1;
 			/* make id optional */
 			if (id) {
-				guint64 id_value = json_integer_value(id);
+				id_value = json_integer_value(id);
 				/* Look for this recording */
 				janus_mutex_lock(&recordings_mutex);
-				janus_recordplay_recording *rec = g_hash_table_lookup(recordings, GINT_TO_POINTER(id_value));
+				rec = g_hash_table_lookup(recordings, GINT_TO_POINTER(id_value));
 				janus_mutex_unlock(&recordings_mutex);
+				if (rec == NULL) {
+					janus_recordplay_update_recordings_list();
+					rec = g_hash_table_lookup(recordings, GINT_TO_POINTER(id_value));
+				}
 				if(rec == NULL || rec->destroyed) {
 					JANUS_LOG(LOG_ERR, "No such recording\n");
 					error_code = JANUS_RECORDPLAY_ERROR_NOT_FOUND;
@@ -1286,20 +1375,7 @@ static void *janus_recordplay_handler(void *data) {
 			json_t *rc_dir = json_object_get(root, "rc_dir");
 			const char *rc_dir_text = NULL;
 			if (rc_dir) {
-				JANUS_LOG(LOG_INFO, "Parsing rc_dir\n");
-				if (!json_is_string(rc_dir)) {
-					JANUS_LOG(LOG_ERR, "Invalid element (rc_dir should be a string)\n");
-					error_code = JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT;
-					g_snprintf(error_cause, 512, "Invalid element (rc_dir should be a string)");
-					goto error;
-				}
 				rc_dir_text = json_string_value(rc_dir);
-				if (strlen(rc_dir_text) == 0) {
-					JANUS_LOG(LOG_ERR, "Invalid element (rc_dir is an empty string)\n");
-					error_code = JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT;
-					g_snprintf(error_cause, 512, "Invalid element (rc_dir is an empty string)");
-					goto error;
-				}
 			}
 			JANUS_LOG(LOG_INFO, "Received rc_dir: %s\n", rc_dir_text);
 
@@ -1308,20 +1384,7 @@ static void *janus_recordplay_handler(void *data) {
 			json_t *arc_file = json_object_get(root, "arc_file");
 			const char *arc_file_text = NULL;
 			if (arc_file) {
-				JANUS_LOG(LOG_INFO, "Parsing arc_file\n");
-				if (!json_is_string(arc_file)) {
-					JANUS_LOG(LOG_ERR, "Invalid element (arc_file should be a string)\n");
-					error_code = JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT;
-					g_snprintf(error_cause, 512, "Invalid element (arc_file should be a string)");
-					goto error;
-				}
 				arc_file_text = json_string_value(arc_file);
-				if (strlen(arc_file_text) == 0) {
-					JANUS_LOG(LOG_ERR, "Invalid element (arc_file is an empty string)\n");
-					error_code = JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT;
-					g_snprintf(error_cause, 512, "Invalid element (arc_file is an empty string)");
-					goto error;
-				}
 			}
 			JANUS_LOG(LOG_INFO, "Received arc_file: %s\n", arc_file_text);
 
@@ -1329,19 +1392,7 @@ static void *janus_recordplay_handler(void *data) {
 			json_t *vrc_file = json_object_get(root, "vrc_file");
 			const char *vrc_file_text = NULL;
 			if (vrc_file) {
-				if (!json_is_string(vrc_file)) {
-					JANUS_LOG(LOG_ERR, "Invalid element (vrc_file should be a string)\n");
-					error_code = JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT;
-					g_snprintf(error_cause, 512, "Invalid element (vrc_file should be a string)");
-					goto error;
-				}
 				vrc_file_text = json_string_value(vrc_file);
-				if (strlen(vrc_file_text) == 0) {
-					JANUS_LOG(LOG_ERR, "Invalid element (vrc_file is an empty string)\n");
-					error_code = JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT;
-					g_snprintf(error_cause, 512, "Invalid element (vrc_file is an empty string)");
-					goto error;
-				}
 			}
 			JANUS_LOG(LOG_INFO, "Received vrc_file: %s\n", vrc_file_text);
 

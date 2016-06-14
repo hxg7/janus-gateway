@@ -245,3 +245,7 @@ gboolean janus_json_is_valid(json_t *val, json_type jtype, unsigned int flags);
 	} while(0)
 
 #endif
+
+void janus_digest_message(const char *message, size_t message_len, char **digest, unsigned int *digest_len);
+int janus_encrypt(unsigned char *plaintext, int plaintext_len, unsigned char *key, unsigned char *iv, unsigned char *ciphertext);
+int janues_decrypt(unsigned char *ciphertext, int ciphertext_len, unsigned char *key, unsigned char *iv, unsigned char *plaintext);
